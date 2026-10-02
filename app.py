@@ -18,42 +18,42 @@ from playwright.async_api import async_playwright
 
 DISCORD_WEBHOOK_ENV_VAR = "DISCORD_WEBHOOK_URL"
 
-# Saved product availability state for NEW STOCK and RESTOCK alerts.
-PRODUCT_STATE_FILE = "productos_estado_english_search.json"
+# This file keeps the previous availability state of every discovered product.
+# It is required to detect a product disappearing and later returning as stock.
+PRODUCT_STATE_FILE = "productos_estado_english_catalog.json"
 
-# Maximum time for a store search page to respond.
-PAGE_TIMEOUT_MS = 15000
+# Main timeout for each store search/catalog page.
+PAGE_TIMEOUT_MS = 20000
 
-# Wait for JavaScript product cards to render after the search page loads.
-MIN_WAIT_AFTER_PAGE_LOAD_MS = 1000
-MAX_WAIT_AFTER_PAGE_LOAD_MS = 1600
+# Wait for product cards rendered by JavaScript after the page DOM is ready.
+MIN_WAIT_AFTER_PAGE_LOAD_MS = 1200
+MAX_WAIT_AFTER_PAGE_LOAD_MS = 2200
 
-# Full-store scan frequency.
+# Full scan interval. Keep it reasonable to avoid overloading store sites.
 MIN_WAIT_BETWEEN_CYCLES_SECONDS = 60
-MAX_WAIT_BETWEEN_CYCLES_SECONDS = 75
+MAX_WAIT_BETWEEN_CYCLES_SECONDS = 90
 
-# Maximum target-product candidates accepted from one store per cycle.
-MAX_PRODUCTS_PER_STORE = 40
+# Avoid collecting too many duplicate/malformed product links per store.
+MAX_PRODUCTS_PER_STORE = 60
 
-# Maximum product records stored in the local JSON state file.
+# Maximum saved products in local state.
 MAX_SAVED_PRODUCT_STATES = 5000
 
-# Important behavior:
-#
-# Some stores do not show a visible Add-to-Cart button or stock quantity on
-# search-result cards. Versions 1 and 2 worked by treating a matching listing
-# as available. Keep this True to preserve that behavior.
-#
-# If a product card explicitly says "Agotado", "Sin stock", "Out of stock",
-# or has a disabled Add-to-Cart button, it is still treated as unavailable.
-ASSUME_LISTING_PRESENT_IS_IN_STOCK = True
-
-# Number of consecutive successful store scans where a tracked product must
-# be absent before it is marked out of stock.
-#
-# 1 is fastest for restocks. Raise to 2 if a store often fails to render cards
-# even when the HTTP response is successful.
+# A product must be absent this many consecutive successful catalog scans
+# before being marked out of stock. Set to 1 for the fastest restock tracking.
 MISSING_SCANS_TO_MARK_OUT_OF_STOCK = 1
+
+# True: alerts for all English Pokémon 30th Anniversary / Celebration products.
+# This includes:
+# - Mini Tin
+# - Booster Bundle
+# - Binder Collection
+# - Elite Trainer Box / ETB
+# - Poster Collection
+# - 3 Pack products, including TCG FACTORY listings
+#
+# False: alerts only for Mini Tin, Booster Bundle, Binder Collection, and ETB.
+MONITOR_ALL_ENGLISH_30TH_PRODUCTS = True
 
 
 # ============================================================
@@ -66,7 +66,10 @@ TIENDAS = {
         "base": "https://www.plazavea.com.pe",
     },
     "Saga Falabella": {
-        "url": "https://www.falabella.com.pe/falabella-pe/search?Ntt=pokemon+30",
+        "url": (
+            "https://www.falabella.com.pe/"
+            "falabella-pe/search?Ntt=pokemon+30"
+        ),
         "base": "https://www.falabella.com.pe",
     },
     "Ripley": {
@@ -74,15 +77,24 @@ TIENDAS = {
         "base": "https://simple.ripley.com.pe",
     },
     "Tai Loy": {
-        "url": "https://www.tailoy.com.pe/catalogsearch/result/?q=pokemon+tcg",
+        "url": (
+            "https://www.tailoy.com.pe/"
+            "catalogsearch/result/?q=pokemon+tcg"
+        ),
         "base": "https://www.tailoy.com.pe",
     },
     "Phantom": {
-        "url": "https://www.phantom.pe/catalogsearch/result/?q=pokemon+tcg",
+        "url": (
+            "https://www.phantom.pe/"
+            "catalogsearch/result/?q=pokemon+tcg"
+        ),
         "base": "https://www.phantom.pe",
     },
     "LawGamers": {
-        "url": "https://www.lawgamers.com/?s=pokemon+tcg&post_type=product",
+        "url": (
+            "https://www.lawgamers.com/"
+            "?s=pokemon+tcg&post_type=product"
+        ),
         "base": "https://www.lawgamers.com",
     },
     "Oechsle": {
@@ -101,7 +113,7 @@ TIENDAS = {
 
 
 # ============================================================
-# TARGET PRODUCT MATCHING
+# OPTIONAL PRODUCT-FAMILY FILTER
 # ============================================================
 
 TARGET_PRODUCT_PATTERNS = (
@@ -128,8 +140,8 @@ def normalizar_texto(texto):
     )
 
 
-def texto_error_corto(error, limite=180):
-    """Returns a compact one-line error description."""
+def texto_error_corto(error, limite=200):
+    """Returns a compact single-line error message."""
     texto = str(error).replace("\n", " ").strip()
 
     if len(texto) > limite:
@@ -139,14 +151,14 @@ def texto_error_corto(error, limite=180):
 
 
 def fecha_utc_actual():
-    """Returns the current UTC time in ISO format."""
+    """Returns the current UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def canonicalizar_link(link):
     """
-    Removes fragments and query strings so tracking parameters do not make
-    the same product look like different products.
+    Removes query strings and fragments so product tracking parameters do not
+    create separate stock records for the same product.
     """
     partes = urlsplit(link)
 
@@ -160,14 +172,7 @@ def canonicalizar_link(link):
 
 
 def es_producto_ingles(texto):
-    """
-    Requires an explicit English-language marker.
-
-    Examples:
-    - English
-    - Inglés
-    - Ingles
-    """
+    """Requires an explicit English/English-language marker."""
     texto_normalizado = normalizar_texto(texto)
 
     return any(
@@ -181,7 +186,7 @@ def es_producto_ingles(texto):
 
 def es_producto_30_aniversario_o_celebration(texto):
     """
-    Matches product naming variations including:
+    Accepts common product naming variants:
 
     - 30.º Aniversario
     - 30° Aniversario
@@ -189,7 +194,7 @@ def es_producto_30_aniversario_o_celebration(texto):
     - 30th Anniversary
     - 30th Celebration
     - 30th Celebrations
-    - Celebración 30
+    - Celebration 30
     - Aniversario 30
     - Colección 30
     """
@@ -231,14 +236,23 @@ def es_producto_30_aniversario_o_celebration(texto):
     )
 
 
+def pertenece_a_familia_objetivo(texto):
+    """Checks Mini Tin, Booster Bundle, Binder Collection, ETB/Elite Trainer."""
+    texto_normalizado = normalizar_texto(texto)
+
+    return any(
+        re.search(patron, texto_normalizado)
+        for patron in TARGET_PRODUCT_PATTERNS
+    )
+
+
 def es_producto_objetivo(texto):
     """
-    Requires all of the following:
+    Main product filter.
 
-    - Pokémon
-    - English / Inglés
-    - 30th Anniversary or 30th Celebration wording
-    - Mini Tin, Booster Bundle, Binder Collection, or ETB
+    Default behavior monitors every English Pokémon 30th product.
+    If MONITOR_ALL_ENGLISH_30TH_PRODUCTS is False, only the requested
+    product families are monitored.
     """
     texto_normalizado = normalizar_texto(texto)
 
@@ -251,15 +265,15 @@ def es_producto_objetivo(texto):
     if not es_producto_30_aniversario_o_celebration(texto_normalizado):
         return False
 
-    return any(
-        re.search(patron, texto_normalizado)
-        for patron in TARGET_PRODUCT_PATTERNS
-    )
+    if MONITOR_ALL_ENGLISH_30TH_PRODUCTS:
+        return True
+
+    return pertenece_a_familia_objetivo(texto_normalizado)
 
 
 def obtener_titulo(texto_ancla, texto_tarjeta):
     """
-    Uses matching card/anchor text to choose the best human-readable title.
+    Chooses the best product title from anchor text and its parent card text.
     """
     lineas = []
 
@@ -271,26 +285,35 @@ def obtener_titulo(texto_ancla, texto_tarjeta):
         )
 
     for linea in lineas:
-        normalizado = normalizar_texto(linea)
-
-        if len(linea) < 10:
+        if len(linea) > 350:
             continue
 
         if es_producto_objetivo(linea):
             return linea
 
-        if "pokemon" in normalizado and len(linea) < 300:
+    for linea in lineas:
+        texto_normalizado = normalizar_texto(linea)
+
+        if (
+            "pokemon" in texto_normalizado
+            and len(linea) >= 10
+            and len(linea) <= 350
+        ):
             return linea
 
     for linea in lineas:
-        if len(linea) >= 10 and len(linea) < 300:
+        if (
+            len(linea) >= 10
+            and len(linea) <= 350
+            and "s/" not in linea.lower()
+        ):
             return linea
 
     return "Pokémon TCG product"
 
 
 def obtener_precio(texto):
-    """Finds a displayed Peruvian Sol price when present."""
+    """Extracts the first Peruvian Sol price found in scraped card text."""
     coincidencia = re.search(
         r"(?:S/|s/)\s*[\d.,]+",
         texto,
@@ -307,22 +330,7 @@ def obtener_precio(texto):
 # ============================================================
 
 def cargar_estados_productos():
-    """
-    State example:
-
-    {
-      "https://phantom.pe/product.html": {
-        "tienda": "Phantom",
-        "titulo": "Pokémon TCG 30th Celebration Mini Tin (Inglés)",
-        "precio": "S/ 99.90",
-        "link": "https://...",
-        "in_stock": true,
-        "missing_scans": 0,
-        "last_seen_utc": "...",
-        "last_stock_change_utc": "..."
-      }
-    }
-    """
+    """Loads previously observed product stock states."""
     try:
         if not os.path.exists(PRODUCT_STATE_FILE):
             return {}
@@ -346,7 +354,7 @@ def cargar_estados_productos():
 
 
 def guardar_estados_productos(estados):
-    """Atomically writes product state to disk."""
+    """Saves product states atomically."""
     try:
         if len(estados) > MAX_SAVED_PRODUCT_STATES:
             claves = sorted(
@@ -384,49 +392,11 @@ def guardar_estados_productos(estados):
         )
 
 
-def registrar_producto_visto(estados, producto, in_stock):
+def clasificar_evento_stock(estados, producto):
     """
-    Records a product observed during a successful store scrape.
-
-    `in_stock` must be True or False when explicitly known. A product found
-    on the search page may be treated as in stock when the card does not show
-    an explicit availability label, depending on the configuration.
+    Returns NEW STOCK or RESTOCK only when the catalog currently contains
+    the matching listing.
     """
-    clave = producto["state_key"]
-    anterior = estados.get(clave, {})
-    ahora = fecha_utc_actual()
-
-    nuevo_estado = {
-        "tienda": producto["tienda"],
-        "titulo": producto["titulo"],
-        "precio": producto["precio"],
-        "link": producto["link"],
-        "in_stock": in_stock,
-        "missing_scans": 0,
-        "last_seen_utc": ahora,
-    }
-
-    if anterior.get("in_stock") != in_stock:
-        nuevo_estado["last_stock_change_utc"] = ahora
-    else:
-        nuevo_estado["last_stock_change_utc"] = anterior.get(
-            "last_stock_change_utc",
-            ahora,
-        )
-
-    estados[clave] = nuevo_estado
-
-
-def clasificar_evento_stock(estados, producto, in_stock):
-    """
-    Returns:
-    - NEW STOCK: first confirmed/assumed available listing
-    - RESTOCK: previously known unavailable item returned to listing/stock
-    - None: item was already known as available
-    """
-    if in_stock is not True:
-        return None
-
     anterior = estados.get(producto["state_key"])
 
     if anterior is None:
@@ -438,20 +408,56 @@ def clasificar_evento_stock(estados, producto, in_stock):
     return None
 
 
-def marcar_productos_faltantes_como_agotados(
-    estados,
-    tienda,
-    links_vistos,
-):
+def registrar_producto_disponible(estados, producto):
+    """Records a product that is currently visible in a successful catalog."""
+    clave = producto["state_key"]
+    anterior = estados.get(clave, {})
+    ahora = fecha_utc_actual()
+
+    estados[clave] = {
+        "tienda": producto["tienda"],
+        "titulo": producto["titulo"],
+        "precio": producto["precio"],
+        "link": producto["link"],
+        "in_stock": True,
+        "missing_scans": 0,
+        "last_seen_utc": ahora,
+        "last_stock_change_utc": anterior.get(
+            "last_stock_change_utc",
+            ahora,
+        ),
+    }
+
+
+def registrar_producto_agotado(estados, producto):
+    """Records an explicit out-of-stock label from the product card."""
+    clave = producto["state_key"]
+    anterior = estados.get(clave, {})
+    ahora = fecha_utc_actual()
+
+    estados[clave] = {
+        "tienda": producto["tienda"],
+        "titulo": producto["titulo"],
+        "precio": producto["precio"],
+        "link": producto["link"],
+        "in_stock": False,
+        "missing_scans": 0,
+        "last_seen_utc": ahora,
+        "last_stock_change_utc": (
+            ahora
+            if anterior.get("in_stock") is not False
+            else anterior.get("last_stock_change_utc", ahora)
+        ),
+    }
+
+
+def marcar_faltantes_como_agotados(estados, tienda, links_vistos):
     """
-    Called only after a successful search-page scrape.
+    Mark a previously known in-stock product as unavailable only after a
+    successful and usable catalog scrape where its link is absent.
 
-    If a tracked product from this store is absent from a successful result
-    page for the configured number of consecutive cycles, it is marked out of
-    stock. If it later reappears, it creates a RESTOCK alert.
-
-    This is intentionally not called after timeouts, 403, 524, Cloudflare
-    pages, or scraper errors.
+    This is never called after HTTP errors, Cloudflare pages, 403/524, or
+    invalid/error pages.
     """
     cambios = 0
     ahora = fecha_utc_actual()
@@ -460,10 +466,10 @@ def marcar_productos_faltantes_como_agotados(
         if estado.get("tienda") != tienda:
             continue
 
-        if clave in links_vistos:
+        if estado.get("in_stock") is not True:
             continue
 
-        if estado.get("in_stock") is not True:
+        if clave in links_vistos:
             continue
 
         faltantes = int(estado.get("missing_scans", 0)) + 1
@@ -475,7 +481,7 @@ def marcar_productos_faltantes_como_agotados(
 
             print(
                 f"{tienda}: Marked OUT OF STOCK after "
-                f"{faltantes} successful missing scan(s): "
+                f"{faltantes} missing successful catalog scan(s): "
                 f"{estado.get('titulo', clave)}"
             )
 
@@ -489,11 +495,7 @@ def marcar_productos_faltantes_como_agotados(
 # ============================================================
 
 async def enviar_discord(webhook_url, tienda, eventos):
-    """
-    Sends Discord notifications for NEW STOCK and RESTOCK events.
-
-    Returns True only when Discord accepted every outbound message.
-    """
+    """Sends NEW STOCK and RESTOCK notifications to Discord."""
     bloques = []
 
     for evento in eventos:
@@ -531,17 +533,20 @@ async def enviar_discord(webhook_url, tienda, eventos):
     def publicar(payload):
         datos = json.dumps(payload).encode("utf-8")
 
-        request = urllib.request.Request(
+        solicitud = urllib.request.Request(
             webhook_url,
             data=datos,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "PKScrapCatalogMonitor/1.0",
+                "User-Agent": "PKScrapCatalogMonitor/2.0",
             },
             method="POST",
         )
 
-        with urllib.request.urlopen(request, timeout=20) as respuesta:
+        with urllib.request.urlopen(
+            solicitud,
+            timeout=20,
+        ) as respuesta:
             return respuesta.status
 
     for contenido in mensajes:
@@ -581,43 +586,55 @@ async def enviar_discord(webhook_url, tienda, eventos):
 
 
 # ============================================================
-# SEARCH-PAGE SCRAPING
+# SEARCH PAGE SCRAPING
 # ============================================================
 
-def es_pagina_error_o_bloqueo(titulo, texto_pagina):
+def parece_pagina_error(titulo, texto):
     """
-    Detects common Cloudflare/origin errors. When detected, the store scan is
-    treated as failed, so existing product states are never changed to
-    out-of-stock because of an error page.
+    Detects known error/access pages.
+
+    It intentionally does not classify every Cloudflare-enabled normal page
+    as an error; it looks for actual challenge/error wording.
     """
-    texto = normalizar_texto(
-        f"{titulo}\n{texto_pagina[:3000]}"
+    contenido = normalizar_texto(
+        f"{titulo}\n{texto[:5000]}"
     )
 
-    indicadores_error = (
+    indicadores = (
         "error code 524",
         "a timeout occurred",
-        "error code 403",
+        "error code 520",
+        "error code 521",
+        "error code 522",
+        "error code 523",
+        "error code 525",
+        "error code 526",
         "access denied",
-        "just a moment",
+        "forbidden",
         "checking your browser",
-        "cloudflare",
+        "just a moment",
+        "attention required",
         "temporarily unavailable",
         "service unavailable",
     )
 
     return any(
-        indicador in texto
-        for indicador in indicadores_error
+        indicador in contenido
+        for indicador in indicadores
     )
 
 
-async def scrapear_resultados_tienda(page, tienda, datos):
+async def scrapear_catalogo_tienda(page, tienda, datos):
     """
-    Scrapes matching product cards from the store's live search/catalog page.
+    Scrapes product listings from the live store search/catalog page.
 
-    This does not use hardcoded individual product URLs. Each product link is
-    discovered from the store page during every scan.
+    This does not use fixed individual product URLs. Product links are
+    discovered from the store's search page every cycle.
+
+    Unlike the recent restrictive version, this function does not immediately
+    abort merely because a response status is 403. It inspects the rendered
+    content first. If the page only contains a denial/error screen, it is
+    treated as unavailable and product state is preserved.
     """
     respuesta = await page.goto(
         datos["url"],
@@ -625,10 +642,7 @@ async def scrapear_resultados_tienda(page, tienda, datos):
         wait_until="domcontentloaded",
     )
 
-    if respuesta is not None and respuesta.status >= 400:
-        raise RuntimeError(
-            f"HTTP {respuesta.status} loading store search page"
-        )
+    http_status = respuesta.status if respuesta is not None else None
 
     await page.wait_for_timeout(
         random.randint(
@@ -640,135 +654,129 @@ async def scrapear_resultados_tienda(page, tienda, datos):
     snapshot = await page.evaluate(
         """
         () => {
+            const clean = (value) =>
+                String(value || "")
+                    .replace(/\\s+/g, " ")
+                    .trim();
+
             const visible = (element) => Boolean(
                 element.offsetWidth ||
                 element.offsetHeight ||
                 element.getClientRects().length
             );
 
-            const cleanText = (text) =>
-                (text || "")
-                    .replace(/\\s+/g, " ")
-                    .trim();
+            const findCard = (anchor) => {
+                let current = anchor;
+                let best = {
+                    node: anchor,
+                    text: clean(anchor.innerText),
+                    score: 0
+                };
 
-            const getCard = (anchor) => {
-                let node = anchor;
-                let best = null;
+                for (let level = 0; level < 8; level += 1) {
+                    current = current.parentElement;
 
-                for (let level = 0; level < 7; level += 1) {
-                    node = node.parentElement;
-
-                    if (!node) {
+                    if (!current) {
                         break;
                     }
 
-                    const text = cleanText(node.innerText || "");
-                    const className = String(node.className || "");
+                    const text = clean(current.innerText);
+                    const className = clean(current.className).toLowerCase();
 
                     if (
                         text.length < 8 ||
-                        text.length > 2500
+                        text.length > 3000
                     ) {
                         continue;
                     }
 
                     let score = 0;
-                    const classLower = className.toLowerCase();
 
                     if (
-                        node.tagName === "ARTICLE" ||
-                        node.tagName === "LI"
+                        current.tagName === "ARTICLE" ||
+                        current.tagName === "LI"
                     ) {
                         score += 20;
                     }
 
                     if (
-                        classLower.includes("product") ||
-                        classLower.includes("card") ||
-                        classLower.includes("item")
+                        className.includes("product") ||
+                        className.includes("card") ||
+                        className.includes("item") ||
+                        className.includes("result")
                     ) {
                         score += 15;
                     }
 
-                    if (
-                        /s\\/\\s*[\\d,.]+/i.test(text)
-                    ) {
+                    if (/s\\/\\s*[\\d,.]+/i.test(text)) {
                         score += 8;
                     }
 
                     if (
-                        /agregar al carrito|add to cart|agotado|sin stock|disponible/i.test(text)
+                        /agregar al carrito|add to cart|agotado|sin stock|out of stock|disponible/i.test(text)
                     ) {
                         score += 8;
                     }
 
                     score -= level;
 
-                    if (
-                        !best ||
-                        score > best.score
-                    ) {
+                    if (score > best.score) {
                         best = {
+                            node: current,
                             text,
-                            node,
                             score
                         };
                     }
                 }
 
-                return best || {
-                    text: cleanText(anchor.innerText || ""),
-                    node: anchor,
-                    score: 0
-                };
+                return best;
             };
+
+            const actionSelector = [
+                "button",
+                "input[type='button']",
+                "input[type='submit']",
+                "[role='button']"
+            ].join(",");
 
             const anchors = Array.from(
                 document.querySelectorAll("a[href]")
             );
 
-            const products = [];
+            const listings = [];
 
             for (const anchor of anchors) {
-                const anchorText = cleanText(anchor.innerText || "");
                 const href = anchor.getAttribute("href") || "";
+                const anchorText = clean(anchor.innerText);
 
                 if (
                     !href ||
-                    anchorText.length < 5 ||
-                    anchorText.length > 500
+                    anchorText.length < 4 ||
+                    anchorText.length > 600
                 ) {
                     continue;
                 }
 
-                const card = getCard(anchor);
-
-                const actionSelector = [
-                    "button",
-                    "input[type='button']",
-                    "input[type='submit']",
-                    "[role='button']"
-                ].join(",");
+                const card = findCard(anchor);
 
                 const buttons = Array.from(
                     card.node.querySelectorAll(actionSelector)
-                ).map((element) => ({
-                    text: cleanText(
-                        element.innerText ||
-                        element.value ||
-                        element.getAttribute("aria-label") ||
-                        element.textContent ||
-                        ""
+                ).map((button) => ({
+                    text: clean(
+                        button.innerText ||
+                        button.value ||
+                        button.getAttribute("aria-label") ||
+                        button.textContent
                     ),
                     disabled: Boolean(
-                        element.disabled ||
-                        element.getAttribute("aria-disabled") === "true" ||
-                        element.classList.contains("disabled")
+                        button.disabled ||
+                        button.getAttribute("aria-disabled") === "true" ||
+                        button.classList.contains("disabled")
                     ),
-                    visible: visible(element)
+                    visible: visible(button)
                 })).filter((button) => button.text);
 
-                products.push({
+                listings.push({
                     href,
                     anchorText,
                     cardText: card.text,
@@ -778,31 +786,32 @@ async def scrapear_resultados_tienda(page, tienda, datos):
 
             return {
                 title: document.title || "",
-                bodyText: document.body && document.body.innerText
-                    ? document.body.innerText
+                bodyText: document.body
+                    ? clean(document.body.innerText)
                     : "",
-                products
+                anchorCount: anchors.length,
+                listings
             };
         }
         """
     )
 
-    if es_pagina_error_o_bloqueo(
+    if parece_pagina_error(
         snapshot.get("title", ""),
         snapshot.get("bodyText", ""),
     ):
         raise RuntimeError(
-            "Store returned a Cloudflare, timeout, access-denied, "
-            "or service-error page"
+            f"HTTP {http_status or 'unknown'} returned an access/error page"
         )
 
     productos = []
     links_vistos = set()
+    near_matches = []
 
-    for item in snapshot.get("products", []):
-        href = item.get("href", "")
-        texto_ancla = item.get("anchorText", "")
-        texto_tarjeta = item.get("cardText", "")
+    for listing in snapshot.get("listings", []):
+        href = listing.get("href", "")
+        texto_ancla = listing.get("anchorText", "")
+        texto_tarjeta = listing.get("cardText", "")
 
         if href.startswith((
             "#",
@@ -813,6 +822,22 @@ async def scrapear_resultados_tienda(page, tienda, datos):
             continue
 
         texto_completo = f"{texto_ancla}\n{texto_tarjeta}"
+        texto_normalizado = normalizar_texto(texto_completo)
+
+        # Keep near-match names for diagnostics if the store returned products
+        # but title wording differs from the configured filters.
+        if (
+            "pokemon" in texto_normalizado
+            and (
+                "30" in texto_normalizado
+                or "celebration" in texto_normalizado
+                or "aniversario" in texto_normalizado
+            )
+            and len(near_matches) < 8
+        ):
+            near_matches.append(
+                obtener_titulo(texto_ancla, texto_tarjeta)
+            )
 
         if not es_producto_objetivo(texto_completo):
             continue
@@ -832,9 +857,9 @@ async def scrapear_resultados_tienda(page, tienda, datos):
 
         precio = obtener_precio(texto_tarjeta)
 
-        in_stock, fuente_stock = detectar_stock_tarjeta(
+        in_stock, stock_source = detectar_estado_stock_tarjeta(
             texto_tarjeta,
-            item.get("buttons", []),
+            listing.get("buttons", []),
         )
 
         productos.append({
@@ -844,23 +869,34 @@ async def scrapear_resultados_tienda(page, tienda, datos):
             "link": link,
             "state_key": state_key,
             "in_stock": in_stock,
-            "stock_source": fuente_stock,
+            "stock_source": stock_source,
         })
 
         if len(productos) >= MAX_PRODUCTS_PER_STORE:
             break
 
-    return productos
+    catalogo_usable = (
+        snapshot.get("anchorCount", 0) >= 5
+        and len(snapshot.get("bodyText", "")) >= 100
+    )
+
+    return {
+        "http_status": http_status,
+        "catalogo_usable": catalogo_usable,
+        "productos": productos,
+        "near_matches": near_matches,
+        "anchor_count": snapshot.get("anchorCount", 0),
+        "page_title": snapshot.get("title", ""),
+    }
 
 
-def detectar_stock_tarjeta(texto_tarjeta, botones):
+def detectar_estado_stock_tarjeta(texto_tarjeta, botones):
     """
-    Determines availability strictly from the scraped catalog card.
+    Determines availability from catalog/search-card data.
 
-    Return values:
-    - (True,  "...")  confirmed/assumed available
-    - (False, "...")  explicitly unavailable
-    - (None,  "...")  unknown, only possible if listing fallback is disabled
+    A visible matching catalog listing is treated as available when no
+    explicit out-of-stock indication is present. This restores the behavior
+    of the original working monitor versions.
     """
     texto = normalizar_texto(texto_tarjeta)
 
@@ -909,30 +945,27 @@ def detectar_stock_tarjeta(texto_tarjeta, botones):
         not boton.get("disabled")
         for boton in botones_carrito
     ):
-        return True, "enabled add-to-cart button in search card"
+        return True, "enabled add-to-cart in catalog"
 
     if botones_carrito and all(
         boton.get("disabled")
         for boton in botones_carrito
     ):
-        return False, "disabled add-to-cart button in search card"
+        return False, "disabled add-to-cart in catalog"
 
     if any(
         re.search(patron, texto)
         for patron in patrones_no_stock
     ):
-        return False, "explicit out-of-stock text in search card"
+        return False, "explicit out-of-stock label in catalog"
 
     if any(
         re.search(patron, texto)
         for patron in patrones_stock
     ):
-        return True, "explicit stock text in search card"
+        return True, "explicit stock label in catalog"
 
-    if ASSUME_LISTING_PRESENT_IS_IN_STOCK:
-        return True, "matching live search listing"
-
-    return None, "stock status unknown"
+    return True, "matching live catalog listing"
 
 
 # ============================================================
@@ -941,8 +974,8 @@ def detectar_stock_tarjeta(texto_tarjeta, botones):
 
 async def ejecutar_ciclo(browser, estados, webhook_url):
     """
-    Scrapes each store catalog/search page, updates availability state, and
-    sends Discord alerts for new listings and listing reappearances.
+    Scrapes every store catalog/search page, records stock state, and sends
+    Discord messages only for NEW STOCK and RESTOCK events.
     """
     context = await browser.new_context(
         user_agent=(
@@ -961,7 +994,7 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
     try:
         for tienda, datos in TIENDAS.items():
             try:
-                productos = await scrapear_resultados_tienda(
+                resultado = await scrapear_catalogo_tienda(
                     page,
                     tienda,
                     datos,
@@ -969,8 +1002,32 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
 
             except Exception as error:
                 print(
-                    f"{tienda}: Search scrape failed; state not changed: "
-                    f"{texto_error_corto(error)}"
+                    f"{tienda}: Catalog scrape unavailable; "
+                    f"state preserved: {texto_error_corto(error)}"
+                )
+                continue
+
+            productos = resultado["productos"]
+
+            print(
+                f"{tienda}: Catalog response HTTP "
+                f"{resultado['http_status'] or 'unknown'} | "
+                f"{resultado['anchor_count']} links | "
+                f"{len(productos)} matching English 30th product(s)."
+            )
+
+            if not productos and resultado["near_matches"]:
+                print(
+                    f"{tienda}: Near-match diagnostics: "
+                    f"{' | '.join(resultado['near_matches'][:5])}"
+                )
+
+            # Do not mark prior products unavailable if the store gave a page
+            # too empty to be treated as a meaningful searchable catalog.
+            if not resultado["catalogo_usable"]:
+                print(
+                    f"{tienda}: Catalog content was too limited to "
+                    "update stock state; state preserved."
                 )
                 continue
 
@@ -979,44 +1036,28 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                 for producto in productos
             }
 
-            print(
-                f"{tienda}: Scraped {len(productos)} matching "
-                "target product listing(s)."
-            )
-
             eventos_pendientes = []
             estado_cambio = False
 
             for producto in productos:
-                in_stock = producto["in_stock"]
-
-                if in_stock is False:
-                    registrar_producto_visto(
+                if producto["in_stock"] is False:
+                    registrar_producto_agotado(
                         estados,
                         producto,
-                        False,
                     )
 
                     estado_cambio = True
 
                     print(
-                        f"{tienda}: OUT OF STOCK: "
+                        f"{tienda}: Explicitly OUT OF STOCK: "
                         f"{producto['titulo']}"
                     )
 
-                    continue
-
-                if in_stock is None:
-                    print(
-                        f"{tienda}: Stock unknown, ignored: "
-                        f"{producto['titulo']}"
-                    )
                     continue
 
                 tipo_evento = clasificar_evento_stock(
                     estados,
                     producto,
-                    True,
                 )
 
                 if tipo_evento:
@@ -1031,10 +1072,9 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                         f"[{producto['stock_source']}]"
                     )
                 else:
-                    registrar_producto_visto(
+                    registrar_producto_disponible(
                         estados,
                         producto,
-                        True,
                     )
 
                     estado_cambio = True
@@ -1044,7 +1084,7 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                         f"{producto['titulo']}"
                     )
 
-            cambios_faltantes = marcar_productos_faltantes_como_agotados(
+            cambios_faltantes = marcar_faltantes_como_agotados(
                 estados,
                 tienda,
                 links_vistos,
@@ -1059,18 +1099,17 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
             if not eventos_pendientes:
                 continue
 
-            discord_enviado = await enviar_discord(
+            enviado = await enviar_discord(
                 webhook_url,
                 tienda,
                 eventos_pendientes,
             )
 
-            if discord_enviado:
+            if enviado:
                 for evento in eventos_pendientes:
-                    registrar_producto_visto(
+                    registrar_producto_disponible(
                         estados,
                         evento["producto"],
-                        True,
                     )
 
                 guardar_estados_productos(estados)
@@ -1081,8 +1120,8 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                 )
             else:
                 print(
-                    f"{tienda}: Discord failed. Products remain "
-                    "eligible for retry during the next cycle."
+                    f"{tienda}: Discord failed; matching products "
+                    "remain eligible for retry next cycle."
                 )
 
     finally:
@@ -1104,18 +1143,21 @@ async def main():
 
     estados = cargar_estados_productos()
 
-    print("=" * 72)
-    print("PKSCRAP SEARCH SCRAPER — ENGLISH POKEMON 30TH RESTOCKS")
+    print("=" * 74)
+    print("PKSCRAP CATALOG SCRAPER — ENGLISH POKÉMON 30TH MONITOR")
     print(f"Configured stores: {len(TIENDAS)}")
     print(f"Saved product states: {len(estados)}")
-    print("Target products:")
-    print("  - Mini Tin")
-    print("  - Booster Bundle")
-    print("  - Binder Collection")
-    print("  - Elite Trainer Box / ETB")
-    print("Detection: live store search/catalog page scraping.")
-    print("Alerts: NEW STOCK and RESTOCK only.")
-    print("=" * 72)
+    print(
+        "Scope: "
+        + (
+            "all English Pokémon 30th products"
+            if MONITOR_ALL_ENGLISH_30TH_PRODUCTS
+            else "Mini Tin, Booster Bundle, Binder Collection, and ETB only"
+        )
+    )
+    print("Mode: search/catalog scraping only; no hardcoded product URLs.")
+    print("Alerts: NEW STOCK and RESTOCK.")
+    print("=" * 74)
 
     ciclo = 1
 
