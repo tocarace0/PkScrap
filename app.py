@@ -18,33 +18,29 @@ from playwright.async_api import async_playwright
 
 DISCORD_WEBHOOK_ENV_VAR = "DISCORD_WEBHOOK_URL"
 
-# This file records whether each matching product was last explicitly
-# confirmed in stock, out of stock, or unknown.
-PRODUCT_STATE_FILE = "productos_estado_english.json"
+# This file saves each product's last confirmed stock state.
+# It is used to detect explicit out-of-stock -> in-stock restocks.
+PRODUCT_STATE_FILE = "productos_estado_english_targeted.json"
 
-# Only English Pokémon 30th Anniversary products are monitored.
-REQUIRE_30TH_ANNIVERSARY = True
-
-# Maximum time for a store or product page to load.
+# Page timeout.
 PAGE_TIMEOUT_MS = 20000
 
-# Delay after loading a search-result page.
+# Delay after loading store search pages.
 MIN_WAIT_BETWEEN_STORES_MS = 1200
 MAX_WAIT_BETWEEN_STORES_MS = 2200
 
-# Delay after loading an individual product page to check stock.
+# Delay after loading individual product pages for stock verification.
 MIN_WAIT_PRODUCT_PAGE_MS = 900
 MAX_WAIT_PRODUCT_PAGE_MS = 1600
 
-# Time between full scans.
+# Time between complete scans.
 MIN_WAIT_BETWEEN_CYCLES_SECONDS = 90
 MAX_WAIT_BETWEEN_CYCLES_SECONDS = 150
 
-# Avoid opening an excessive number of product pages if a store search
-# page returns duplicate or malformed matches.
-MAX_PRODUCTS_TO_VERIFY_PER_STORE = 25
+# Safety limit: do not open too many candidate product pages per store.
+MAX_PRODUCTS_TO_VERIFY_PER_STORE = 30
 
-# Maximum saved product states.
+# Maximum product states saved in the JSON file.
 MAX_SAVED_PRODUCT_STATES = 5000
 
 
@@ -93,6 +89,20 @@ TIENDAS = {
 
 
 # ============================================================
+# TARGET PRODUCTS
+# ============================================================
+
+# The product must match one of these product families.
+TARGET_PRODUCT_PATTERNS = (
+    r"\bmini\s*tin\b",
+    r"\bbooster\s*bundle\b",
+    r"\bbinder\s*collection\b",
+    r"\belite\s*trainer\s*box\b",
+    r"\betb\b",
+)
+
+
+# ============================================================
 # TEXT HELPERS
 # ============================================================
 
@@ -114,18 +124,18 @@ def texto_error_corto(error, limite=180):
     if len(texto) > limite:
         return texto[:limite] + "..."
 
-    return texto or "Error desconocido"
+    return texto or "Unknown error"
 
 
 def fecha_utc_actual():
-    """Returns a readable UTC timestamp for the state file."""
+    """Returns an ISO UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def canonicalizar_link(link):
     """
-    Removes URL fragments and query strings used for tracking so the same
-    product does not create multiple state entries because of URL parameters.
+    Removes fragments and query-string tracking parameters so one product URL
+    has one persistent state record.
     """
     partes = urlsplit(link)
 
@@ -140,52 +150,62 @@ def canonicalizar_link(link):
 
 def es_producto_ingles(texto):
     """
-    Returns True only if the listing explicitly identifies the product as
-    English or Inglés.
+    Requires an explicit English-language marker.
+
+    Examples accepted:
+    - English
+    - Inglés
+    - Ingles
     """
     texto_normalizado = normalizar_texto(texto)
 
-    indicadores_ingles = (
-        "english",
-        "ingles",
-    )
-
     return any(
         indicador in texto_normalizado
-        for indicador in indicadores_ingles
+        for indicador in (
+            "english",
+            "ingles",
+        )
     )
 
 
-def es_producto_30_aniversario(texto):
+def es_producto_30_aniversario_o_celebration(texto):
     """
-    Matches common Pokémon 30th Anniversary formats, including:
+    Recognizes Pokémon's 30th Anniversary / 30th Celebration variants.
 
+    Examples accepted:
     - 30 Aniversario
     - 30.º Aniversario
     - 30° Aniversario
-    - 30o Aniversario
     - 30th Anniversary
+    - 30th Celebration
+    - 30th Celebrations
     - Aniversario 30
+    - Celebration 30
     - Colección 30
-    - Collection 30
     """
     texto_normalizado = normalizar_texto(texto)
 
     patrones_validos = (
         r"\b30\s*(?:th|[.\u00ba\u00b0o]+)?\s*aniversario\b",
+        r"\b30\s*(?:th|[.\u00ba\u00b0o]+)?\s*anniversary\b",
+        r"\b30\s*(?:th|[.\u00ba\u00b0o]+)?\s*celebration(?:s)?\b",
         r"\b30th\s+anniversary\b",
+        r"\b30th\s+celebration(?:s)?\b",
         r"\baniversario\s*(?:[.\u00ba\u00b0o]+)?\s*30\b",
+        r"\banniversary\s*(?:[.\u00ba\u00b0o]+)?\s*30\b",
+        r"\bcelebration(?:s)?\s*(?:[.\u00ba\u00b0o]+)?\s*30\b",
+        r"\bcelebracion(?:es)?\s*(?:[.\u00ba\u00b0o]+)?\s*30\b",
         r"\bcoleccion\s*(?:[.\u00ba\u00b0o]+)?\s*30\b",
         r"\bcollection\s*(?:[.\u00ba\u00b0o]+)?\s*30\b",
     )
 
     patrones_falsos = (
         r"\b20\s*(?:th|[.\u00ba\u00b0o]+)?\s*aniversario\b",
+        r"\b20\s*(?:th|[.\u00ba\u00b0o]+)?\s*anniversary\b",
         r"\b25\s*(?:th|[.\u00ba\u00b0o]+)?\s*aniversario\b",
+        r"\b25\s*(?:th|[.\u00ba\u00b0o]+)?\s*anniversary\b",
         r"\b20th\b",
         r"\b25th\b",
-        r"\b20\s*aniversario\b",
-        r"\b25\s*aniversario\b",
         r"\b30\s*cm\b",
     )
 
@@ -201,45 +221,70 @@ def es_producto_30_aniversario(texto):
     )
 
 
+def es_producto_objetivo(texto):
+    """
+    Returns True only for the requested English 30th products:
+
+    - Mini Tin
+    - Booster Bundle
+    - Binder Collection
+    - Elite Trainer Box / ETB
+    """
+    texto_normalizado = normalizar_texto(texto)
+
+    if "pokemon" not in texto_normalizado:
+        return False
+
+    if not es_producto_ingles(texto_normalizado):
+        return False
+
+    if not es_producto_30_aniversario_o_celebration(texto_normalizado):
+        return False
+
+    return any(
+        re.search(patron, texto_normalizado)
+        for patron in TARGET_PRODUCT_PATTERNS
+    )
+
+
 def obtener_titulo(lineas):
-    """
-    Attempts to choose the actual product title rather than a price,
-    stock label, or generic store text.
-    """
+    """Attempts to select the actual product title from a product card."""
     for linea in lineas:
-        linea_normalizada = normalizar_texto(linea)
+        texto = linea.strip()
+        texto_normalizado = normalizar_texto(texto)
 
-        if len(linea.strip()) < 8:
+        if len(texto) < 8:
             continue
 
-        if "s/" in linea.lower():
+        if "s/" in texto.lower():
             continue
 
-        if "precio" in linea_normalizada:
+        if "precio" in texto_normalizado:
             continue
 
-        if "pokemon" in linea_normalizada:
-            return linea.strip()
+        if "pokemon" in texto_normalizado:
+            return texto
 
     for linea in lineas:
-        linea_normalizada = normalizar_texto(linea)
+        texto = linea.strip()
+        texto_normalizado = normalizar_texto(texto)
 
-        if len(linea.strip()) < 8:
+        if len(texto) < 8:
             continue
 
-        if "s/" in linea.lower():
+        if "s/" in texto.lower():
             continue
 
-        if "precio" in linea_normalizada:
+        if "precio" in texto_normalizado:
             continue
 
-        return linea.strip()
+        return texto
 
     return lineas[0].strip()
 
 
 def obtener_precio(lineas):
-    """Attempts to find the price displayed in a product card."""
+    """Finds a Peruvian Sol price in card text if available."""
     for linea in lineas:
         if "s/" in linea.lower():
             return linea.strip()
@@ -252,19 +297,20 @@ def obtener_precio(lineas):
 
 
 # ============================================================
-# PRODUCT-STATE FILE
+# PRODUCT STATE STORAGE
 # ============================================================
 
 def cargar_estados_productos():
     """
-    Loads product states.
+    Loads previously observed product stock states.
 
-    State format:
+    Format:
     {
-      "canonical-product-url": {
-        "tienda": "Plaza Vea",
-        "titulo": "...",
+      "https://store/product": {
+        "tienda": "Phantom",
+        "titulo": "Pokémon TCG 30th Celebration Mini Tin (Inglés)",
         "precio": "S/ 99.90",
+        "link": "https://...",
         "in_stock": true,
         "last_seen_utc": "...",
         "last_stock_change_utc": "..."
@@ -294,7 +340,7 @@ def cargar_estados_productos():
 
 
 def guardar_estados_productos(estados):
-    """Atomically saves product stock states."""
+    """Atomically saves product state data."""
     try:
         if len(estados) > MAX_SAVED_PRODUCT_STATES:
             claves_ordenadas = sorted(
@@ -332,55 +378,12 @@ def guardar_estados_productos(estados):
         )
 
 
-def actualizar_estado_producto(estados, producto, in_stock):
-    """
-    Updates stored state after a confirmed scan result.
-
-    Unknown stock status is stored as metadata, but it does not overwrite a
-    known in-stock/out-of-stock state. That avoids a page-load issue causing
-    a false restock event on the next cycle.
-    """
-    clave = producto["state_key"]
-    estado_anterior = estados.get(clave, {})
-    ahora = fecha_utc_actual()
-
-    nuevo_estado = {
-        "tienda": producto["tienda"],
-        "titulo": producto["titulo"],
-        "precio": producto["precio"],
-        "link": producto["link"],
-        "last_seen_utc": ahora,
-    }
-
-    if in_stock is None:
-        nuevo_estado["in_stock"] = estado_anterior.get("in_stock")
-        nuevo_estado["last_stock_change_utc"] = estado_anterior.get(
-            "last_stock_change_utc"
-        )
-    else:
-        estado_previo_stock = estado_anterior.get("in_stock")
-
-        nuevo_estado["in_stock"] = in_stock
-
-        if estado_previo_stock != in_stock:
-            nuevo_estado["last_stock_change_utc"] = ahora
-        else:
-            nuevo_estado["last_stock_change_utc"] = estado_anterior.get(
-                "last_stock_change_utc",
-                ahora,
-            )
-
-    estados[clave] = nuevo_estado
-
-
 def clasificar_evento_stock(estados, producto, in_stock):
     """
-    Decides whether an explicit stock transition should create a Discord alert.
-
     Returns:
-    - "NEW STOCK" if this is the first confirmed in-stock observation.
-    - "RESTOCK" if last known state was explicitly out of stock.
-    - None for unchanged stock, unknown stock, or first observation out of stock.
+    - NEW STOCK: first confirmed in-stock observation
+    - RESTOCK: last confirmed state was out of stock and it is now in stock
+    - None: unchanged stock or unknown/unconfirmed stock
     """
     if in_stock is not True:
         return None
@@ -401,15 +404,55 @@ def clasificar_evento_stock(estados, producto, in_stock):
     return None
 
 
+def actualizar_estado_producto(estados, producto, in_stock):
+    """
+    Saves confirmed state.
+
+    If stock is unknown, retain the prior confirmed availability state rather
+    than falsely treating a page-load problem as an out-of-stock transition.
+    """
+    clave = producto["state_key"]
+    anterior = estados.get(clave, {})
+    ahora = fecha_utc_actual()
+
+    estado_nuevo = {
+        "tienda": producto["tienda"],
+        "titulo": producto["titulo"],
+        "precio": producto["precio"],
+        "link": producto["link"],
+        "last_seen_utc": ahora,
+    }
+
+    if in_stock is None:
+        estado_nuevo["in_stock"] = anterior.get("in_stock")
+        estado_nuevo["last_stock_change_utc"] = anterior.get(
+            "last_stock_change_utc"
+        )
+    else:
+        estado_previo_stock = anterior.get("in_stock")
+
+        estado_nuevo["in_stock"] = in_stock
+
+        if estado_previo_stock != in_stock:
+            estado_nuevo["last_stock_change_utc"] = ahora
+        else:
+            estado_nuevo["last_stock_change_utc"] = anterior.get(
+                "last_stock_change_utc",
+                ahora,
+            )
+
+    estados[clave] = estado_nuevo
+
+
 # ============================================================
-# DISCORD
+# DISCORD NOTIFICATIONS
 # ============================================================
 
 async def enviar_discord(webhook_url, tienda, eventos):
     """
-    Sends all new-stock/restock alerts for one store.
+    Sends Discord alerts for confirmed NEW STOCK and RESTOCK events.
 
-    Returns True only when Discord accepted every message.
+    Returns True only if every Discord message was accepted.
     """
     bloques = []
 
@@ -426,8 +469,8 @@ async def enviar_discord(webhook_url, tienda, eventos):
         )
 
     encabezado = (
-        f"**POKEMON TCG 30TH ANNIVERSARY ENGLISH ALERT — {tienda}**\n"
-        f"Confirmed stock events: {len(eventos)}\n\n"
+        f"**POKÉMON TCG 30TH ENGLISH STOCK ALERT — {tienda}**\n"
+        f"Confirmed events: {len(eventos)}\n\n"
     )
 
     mensajes = []
@@ -453,7 +496,7 @@ async def enviar_discord(webhook_url, tienda, eventos):
             data=datos,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "PKScrapRestockMonitor/1.0",
+                "User-Agent": "PKScrapTargetedRestockMonitor/1.0",
             },
             method="POST",
         )
@@ -463,7 +506,7 @@ async def enviar_discord(webhook_url, tienda, eventos):
 
     for contenido in mensajes:
         payload = {
-            "username": "Pokemon English Restock Alert",
+            "username": "Pokemon English Stock Alert",
             "content": contenido[:1900],
             "allowed_mentions": {
                 "parse": [],
@@ -475,7 +518,7 @@ async def enviar_discord(webhook_url, tienda, eventos):
 
             if estado_http not in (200, 204):
                 print(
-                    f"[ERROR] Discord returned unexpected status: "
+                    f"[ERROR] Discord returned unexpected HTTP status "
                     f"{estado_http}"
                 )
                 return False
@@ -498,13 +541,14 @@ async def enviar_discord(webhook_url, tienda, eventos):
 
 
 # ============================================================
-# STORE SEARCH AND STOCK VERIFICATION
+# PRODUCT SEARCH
 # ============================================================
 
 async def buscar_productos_candidatos(page, tienda, datos):
     """
-    Searches a store page for possible English Pokémon 30th Anniversary
-    product links. It does not decide availability yet.
+    Searches store result pages for the requested English product families.
+
+    Availability is verified separately on the actual product page.
     """
     await page.goto(
         datos["url"],
@@ -571,7 +615,10 @@ async def buscar_productos_candidatos(page, tienda, datos):
         link = urljoin(datos["base"], href)
         state_key = canonicalizar_link(link)
 
-        if not state_key or state_key in enlaces_vistos:
+        if not state_key:
+            continue
+
+        if state_key in enlaces_vistos:
             continue
 
         lineas = [
@@ -584,18 +631,8 @@ async def buscar_productos_candidatos(page, tienda, datos):
             continue
 
         texto_completo = " ".join(lineas)
-        texto_normalizado = normalizar_texto(texto_completo)
 
-        if "pokemon" not in texto_normalizado:
-            continue
-
-        if not es_producto_ingles(texto_completo):
-            continue
-
-        if (
-            REQUIRE_30TH_ANNIVERSARY
-            and not es_producto_30_aniversario(texto_completo)
-        ):
+        if not es_producto_objetivo(texto_completo):
             continue
 
         titulo = obtener_titulo(lineas)
@@ -623,17 +660,24 @@ async def buscar_productos_candidatos(page, tienda, datos):
     return productos
 
 
+# ============================================================
+# PRODUCT-PAGE STOCK VERIFICATION
+# ============================================================
+
 async def verificar_stock_producto(page, producto):
     """
-    Opens the actual product page and determines stock status.
+    Opens the actual product page and checks explicit stock signals.
 
     Returns:
-    - True: explicit available/add-to-cart state found;
-    - False: explicit unavailable/sold-out state found;
-    - None: stock status could not be determined safely.
+    - True: confirmed in stock
+    - False: confirmed out of stock
+    - None: could not safely determine stock status
 
-    Unknown does not produce a Discord alert and does not overwrite a prior
-    confirmed stock state.
+    Strongest signals:
+    1. Visible enabled "Add to Cart" button -> True
+    2. Visible disabled "Add to Cart" button -> False
+    3. Product-page stock status element -> True / False
+    4. Explicit stock text / out-of-stock text -> True / False
     """
     await page.goto(
         producto["link"],
@@ -651,11 +695,16 @@ async def verificar_stock_producto(page, producto):
     snapshot = await page.evaluate(
         """
         () => {
-            const bodyText = document.body && document.body.innerText
-                ? document.body.innerText
-                : "";
+            const visible = (element) => Boolean(
+                element.offsetWidth ||
+                element.offsetHeight ||
+                element.getClientRects().length
+            );
 
-            const selector = [
+            const actionSelector = [
+                "#product-addtocart-button",
+                "[id*='addtocart']",
+                "[class*='addtocart']",
                 "button",
                 "input[type='button']",
                 "input[type='submit']",
@@ -663,40 +712,55 @@ async def verificar_stock_producto(page, producto):
                 "a[role='button']"
             ].join(",");
 
+            const stockSelector = [
+                ".stock",
+                ".stock.available",
+                ".stock.unavailable",
+                "[class*='stock']",
+                "[class*='availability']",
+                "[data-testid*='stock']",
+                "[data-testid*='availability']"
+            ].join(",");
+
             const actions = Array.from(
-                document.querySelectorAll(selector)
-            ).map((element) => {
-                const text = (
+                document.querySelectorAll(actionSelector)
+            ).map((element) => ({
+                text: (
                     element.innerText ||
                     element.value ||
                     element.getAttribute("aria-label") ||
                     element.textContent ||
                     ""
-                ).trim();
-
-                const disabled = Boolean(
+                ).trim(),
+                disabled: Boolean(
                     element.disabled ||
                     element.getAttribute("aria-disabled") === "true" ||
                     element.classList.contains("disabled")
-                );
+                ),
+                visible: visible(element),
+                className: String(element.className || "")
+            })).filter((item) => item.text);
 
-                const visible = Boolean(
-                    element.offsetWidth ||
-                    element.offsetHeight ||
-                    element.getClientRects().length
-                );
-
-                return {
-                    text,
-                    disabled,
-                    visible
-                };
-            }).filter((action) => action.text);
+            const stockElements = Array.from(
+                document.querySelectorAll(stockSelector)
+            ).map((element) => ({
+                text: (
+                    element.innerText ||
+                    element.getAttribute("aria-label") ||
+                    element.textContent ||
+                    ""
+                ).trim(),
+                className: String(element.className || ""),
+                visible: visible(element)
+            })).filter((item) => item.visible && item.text);
 
             return {
                 title: document.title || "",
-                bodyText,
-                actions
+                bodyText: document.body && document.body.innerText
+                    ? document.body.innerText
+                    : "",
+                actions,
+                stockElements
             };
         }
         """
@@ -707,6 +771,7 @@ async def verificar_stock_producto(page, producto):
     )
 
     acciones = snapshot.get("actions", [])
+    stock_elements = snapshot.get("stockElements", [])
 
     patrones_agregar_carrito = (
         r"\bagregar al carrito\b",
@@ -725,14 +790,15 @@ async def verificar_stock_producto(page, producto):
         r"\bnot available\b",
     )
 
-    patrones_stock_texto = (
+    patrones_stock = (
         r"\ben stock\b",
         r"\bdisponible\b",
         r"\bultimas unidades\b",
         r"\bultima unidad\b",
+        r"\b\d+\s*(?:unid|unidades|unidad)\b",
     )
 
-    acciones_carrito = []
+    botones_carrito = []
 
     for accion in acciones:
         if not accion.get("visible"):
@@ -744,30 +810,55 @@ async def verificar_stock_producto(page, producto):
             re.search(patron, texto_accion)
             for patron in patrones_agregar_carrito
         ):
-            acciones_carrito.append(accion)
+            botones_carrito.append(accion)
 
-    # A visible and enabled cart button is the strongest availability signal.
-    if any(not accion.get("disabled") for accion in acciones_carrito):
+    # A visible enabled cart button is the strongest positive signal.
+    if any(
+        not boton.get("disabled")
+        for boton in botones_carrito
+    ):
         return True
 
-    # A visible but disabled cart button is an explicit unavailable state.
-    if acciones_carrito and all(
-        accion.get("disabled")
-        for accion in acciones_carrito
+    # A visible disabled cart button is an explicit unavailable signal.
+    if botones_carrito and all(
+        boton.get("disabled")
+        for boton in botones_carrito
     ):
         return False
 
-    # Explicit unavailable page text is stronger than generic availability text.
+    # Check dedicated product stock/availability elements before generic body text.
+    for elemento in stock_elements:
+        texto_elemento = normalizar_texto(elemento.get("text", ""))
+        clase_elemento = normalizar_texto(elemento.get("className", ""))
+
+        if any(
+            re.search(patron, texto_elemento)
+            for patron in patrones_no_stock
+        ):
+            return False
+
+        if "unavailable" in clase_elemento:
+            return False
+
+        if any(
+            re.search(patron, texto_elemento)
+            for patron in patrones_stock
+        ):
+            return True
+
+        if "available" in clase_elemento:
+            return True
+
+    # Generic product-page body fallback.
     if any(
         re.search(patron, texto_total)
         for patron in patrones_no_stock
     ):
         return False
 
-    # Some stores do not expose a button text but do show explicit stock text.
     if any(
         re.search(patron, texto_total)
-        for patron in patrones_stock_texto
+        for patron in patrones_stock
     ):
         return True
 
@@ -775,13 +866,13 @@ async def verificar_stock_producto(page, producto):
 
 
 # ============================================================
-# ONE COMPLETE SCAN CYCLE
+# SCAN CYCLE
 # ============================================================
 
 async def ejecutar_ciclo(browser, estados, webhook_url):
     """
-    Scans every configured store, verifies product-page stock, records explicit
-    state changes, and sends Discord alerts for new stock/restocks only.
+    Searches every store, verifies actual product-page stock, stores stock
+    transitions, and alerts Discord only for new stock and restocks.
     """
     context = await browser.new_context(
         user_agent=(
@@ -809,18 +900,18 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
 
                 if not productos:
                     print(
-                        f"{tienda}: No English 30th Anniversary "
-                        "product candidates found."
+                        f"{tienda}: No matching English Mini Tin, "
+                        "Booster Bundle, Binder Collection, or ETB found."
                     )
                     continue
 
                 print(
-                    f"{tienda}: Found {len(productos)} English 30th "
-                    "Anniversary candidate(s). Verifying stock..."
+                    f"{tienda}: Found {len(productos)} target product "
+                    "candidate(s). Verifying stock..."
                 )
 
                 eventos_pendientes = []
-                hubo_cambios_estado = False
+                estado_modificado = False
 
                 for producto in productos:
                     try:
@@ -831,16 +922,16 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
 
                     except Exception as error:
                         print(
-                            f"{tienda}: Could not verify stock for "
-                            f"'{producto['titulo']}': "
+                            f"{tienda}: Product stock verification failed "
+                            f"for '{producto['titulo']}': "
                             f"{texto_error_corto(error)}"
                         )
                         continue
 
                     if in_stock is None:
                         print(
-                            f"{tienda}: Stock unknown for "
-                            f"'{producto['titulo']}'. No alert sent."
+                            f"{tienda}: Stock status UNKNOWN: "
+                            f"{producto['titulo']}"
                         )
 
                         actualizar_estado_producto(
@@ -849,18 +940,12 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                             None,
                         )
 
-                        hubo_cambios_estado = True
+                        estado_modificado = True
                         continue
-
-                    tipo_evento = clasificar_evento_stock(
-                        estados,
-                        producto,
-                        in_stock,
-                    )
 
                     if in_stock is False:
                         print(
-                            f"{tienda}: Explicitly out of stock: "
+                            f"{tienda}: OUT OF STOCK: "
                             f"{producto['titulo']}"
                         )
 
@@ -870,10 +955,15 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                             False,
                         )
 
-                        hubo_cambios_estado = True
+                        estado_modificado = True
                         continue
 
-                    # Product is explicitly in stock.
+                    tipo_evento = clasificar_evento_stock(
+                        estados,
+                        producto,
+                        True,
+                    )
+
                     if tipo_evento:
                         print(
                             f"{tienda}: {tipo_evento}: "
@@ -886,7 +976,7 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                         })
                     else:
                         print(
-                            f"{tienda}: Still in stock; no repeat alert: "
+                            f"{tienda}: STILL IN STOCK, no repeated alert: "
                             f"{producto['titulo']}"
                         )
 
@@ -896,9 +986,10 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
                             True,
                         )
 
-                        hubo_cambios_estado = True
+                        estado_modificado = True
 
-                if hubo_cambios_estado:
+                # Save out-of-stock and unchanged in-stock states immediately.
+                if estado_modificado:
                     guardar_estados_productos(estados)
 
                 if not eventos_pendientes:
@@ -922,12 +1013,12 @@ async def ejecutar_ciclo(browser, estados, webhook_url):
 
                     print(
                         f"{tienda}: Discord sent "
-                        f"{len(eventos_pendientes)} stock alert(s)."
+                        f"{len(eventos_pendientes)} notification(s)."
                     )
                 else:
                     print(
-                        f"{tienda}: Discord failed. In-stock state was "
-                        "not saved, so these alerts will retry next cycle."
+                        f"{tienda}: Discord failed. Matching in-stock "
+                        "products will be retried next cycle."
                     )
 
             except Exception as error:
@@ -949,8 +1040,7 @@ async def main():
 
     if not webhook_url:
         print(
-            f"[ERROR] Missing {DISCORD_WEBHOOK_ENV_VAR}. "
-            "The monitor cannot send Discord alerts."
+            f"[ERROR] {DISCORD_WEBHOOK_ENV_VAR} is not configured."
         )
         return
 
@@ -958,19 +1048,23 @@ async def main():
         "https://discord.com/api/webhooks/"
     ):
         print(
-            "[WARNING] DISCORD_WEBHOOK_URL does not appear to be "
-            "a normal Discord webhook URL."
+            "[WARNING] DISCORD_WEBHOOK_URL does not look like "
+            "a standard Discord webhook URL."
         )
 
     estados = cargar_estados_productos()
 
-    print("=" * 68)
-    print("PKSCRAP ENGLISH POKEMON 30TH ANNIVERSARY RESTOCK MONITOR")
+    print("=" * 72)
+    print("PKSCRAP TARGETED ENGLISH POKEMON 30TH RESTOCK MONITOR")
     print(f"Configured stores: {len(TIENDAS)}")
     print(f"Saved product states: {len(estados)}")
-    print("Alerts: first confirmed stock and explicit restocks only.")
-    print("Press Ctrl+C to stop when running manually.")
-    print("=" * 68)
+    print("Target products:")
+    print("  - Mini Tin")
+    print("  - Booster Bundle")
+    print("  - Binder Collection")
+    print("  - Elite Trainer Box / ETB")
+    print("Alerts: NEW STOCK and explicit OUT OF STOCK -> RESTOCK only.")
+    print("=" * 72)
 
     ciclo = 1
 
@@ -981,11 +1075,14 @@ async def main():
 
         try:
             while True:
-                fecha = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                fecha_hora = datetime.now().strftime(
+                    "%d/%m/%Y %H:%M:%S"
+                )
 
                 print()
                 print(
-                    f"=== Starting scan cycle #{ciclo} [{fecha}] ==="
+                    f"=== Starting scan cycle #{ciclo} "
+                    f"[{fecha_hora}] ==="
                 )
 
                 await ejecutar_ciclo(
@@ -1000,7 +1097,7 @@ async def main():
                 )
 
                 print(
-                    f"=== Scan cycle complete. Next cycle in "
+                    f"=== Cycle complete. Next scan in "
                     f"{espera} seconds. ==="
                 )
 
