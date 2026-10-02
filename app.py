@@ -1,5 +1,3 @@
-```python
-#!/usr/bin/env python3
 """
 POKÉMON TCG — English 30th Anniversary / Celebration Stock Monitor
 
